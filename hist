@@ -1,22 +1,29 @@
-#!/bin/bash
+#! /usr/bin/env bash
 
-VERSION="0.0.2"
-HISTORIAN_SRC=${HISTORIAN_SRC-"${HOME}/.bash_history"}
-HISTORIAN_DB=${HISTORIAN_DB-"${HOME}/.historian.db"}
-HISTORIAN_SQLITE3=${HISTORIAN_SQLITE3-"$(which sqlite3)"}
-MAGIC="$(echo -e "\x10\x83\xB9\x9F\x34\xB5\x96\x45")" # 0118 999 881 999 119 725 3
-MAGIC_ENUM_QUOTE=1
+typeset -r \
+    VERSION="0.1.0" \
+    HISTORIAN_SRC=${HISTORIAN_SRC-"${HOME}/.bash_history"} \
+    HISTORIAN_DB=${HISTORIAN_DB-"${HOME}/.historian.db"} \
+    HISTORIAN_SQLITE3=${HISTORIAN_SQLITE3-"$(which sqlite3)"} \
+    MAGIC_ENUM_QUOTE=1 \
+    MAGIC="$(echo -e "\x10\x83\xB9\x9F\x34\xB5\x96\x45")" # 0118 999 881 999 119 725 3
 
 usage() {
-    echo "Usage: hist <subcommand>" >&2
-    echo "subcommands:" >&2
-    echo "  config           show config" >&2
-    echo "  count            count items in history" >&2
-    echo "  import           import to db" >&2
-    echo "  shell            launch sqlite3 shell with db" >&2
-    echo "  search <term>    search for <term>" >&2
-    echo "    /term          search for <term>" >&2
-    echo "  version          show the version" >&2
+    cat >&2 <<EOF
+Usage: hist <subcommand>
+subcommands:
+  config            show config
+  count             count items in history
+  import            import to db
+  shell             launch sqlite3 shell with db
+  search <terms...> search for one or more search terms
+    /term           search for <term>
+  version           show the version
+EOF
+}
+
+historian_sqlite() {
+    "${HISTORIAN_SQLITE3}" "${HISTORIAN_DB}"
 }
 
 preflight_check() {
@@ -32,7 +39,7 @@ preflight_check() {
 }
 
 ensure_db_exists() {
-    ( cat <<SQL
+    historian_sqlite <<SQL
         CREATE TABLE IF NOT EXISTS history (
             id INTEGER PRIMARY KEY ASC,
             command TEXT NOT NULL,
@@ -43,14 +50,11 @@ ensure_db_exists() {
         CREATE VIRTUAL TABLE IF NOT EXISTS
             history_search USING fts4(id, history, command);
 SQL
-    ) | "${HISTORIAN_SQLITE3}" "${HISTORIAN_DB}";
 }
 
 get_magic() {
-    local idx=$1
-    let offset_idx=idx+11
-    suffix=$(printf "%02d" ${offset_idx})
-    echo -n "${MAGIC}$(echo -ne "\x${suffix}")"
+    local -ri idx=$1
+    echo -n "${MAGIC}$(echo -ne "\x$((idx + 11))")"
 }
 
 fail_unless_db_exists() {
@@ -61,101 +65,95 @@ fail_unless_db_exists() {
 }
 
 cmd_config() {
-    echo "version:        ${VERSION}"
-    echo "source_history: ${HISTORIAN_SRC}"
-    echo "db:             ${HISTORIAN_DB}"
-    echo "sqlite3:        ${HISTORIAN_SQLITE3}"
+    cat <<EOF
+version:        ${VERSION}
+source_history: ${HISTORIAN_SRC}
+db:             ${HISTORIAN_DB}
+sqlite3:        ${HISTORIAN_SQLITE3}
+EOF
 }
 
 cmd_count() {
-    local args=$@
-    preflight_check;
-    ensure_db_exists;
+    preflight_check
+    ensure_db_exists
 
-    ( cat <<SQL
-        SELECT COUNT(*) FROM history;
-SQL
-    ) | "${HISTORIAN_SQLITE3}" "${HISTORIAN_DB}";
+    historian_sqlite <<< 'SELECT COUNT(*) FROM history;'
 }
 
 cmd_import() {
-    local args=$@
-    preflight_check;
-    ensure_db_exists;
+    preflight_check
+    ensure_db_exists
 
-    sanitized_src=$(mktemp)
-    cat ${HISTORIAN_SRC} \
-        | sed -e 's/"/'$(get_magic ${MAGIC_ENUM_QUOTE})'/g' \
-        > "${sanitized_src}" \
-    ;
-    ( cat <<SQL
+    local -r column_separator=$(echo -e "\x01")
+    local -r magic=$(get_magic "${MAGIC_ENUM_QUOTE}")
+    readonly sanitized_src=$(mktemp)
+
+    cleanup() { rm -f "$sanitized_src"; }
+    trap cleanup EXIT
+
+    sed -e 's/"/'"$magic"'/g' \
+        < "${HISTORIAN_SRC}" \
+        > "${sanitized_src}"
+
+    historian_sqlite <<SQL
         CREATE TEMPORARY TABLE variables
             (key TEXT, value INTEGER);
         INSERT INTO variables(key, value)
             SELECT 'items', COUNT(*) FROM history;
         CREATE TEMPORARY TABLE history_import (line TEXT);
-.separator $(echo -e "\x01")
+.separator $column_separator
 .import ${sanitized_src} history_import
         UPDATE history_import
-            SET line = REPLACE(line, '$(get_magic ${MAGIC_ENUM_QUOTE})', '"');
+            SET line = REPLACE(line, '$magic', '"');
         INSERT OR IGNORE INTO history(command, timestamp)
             SELECT line, NULL FROM history_import;
-        UPDATE variables
-            SET value = -1 * value + (SELECT COUNT(*) FROM history); -- lol subtraction
-        SELECT 'Imported ' || value || ' item(s).' FROM variables WHERE key = 'items';
+        SELECT 'Imported '
+            || (SELECT COUNT(*) - value FROM history)
+            || ' item(s).'
+            FROM variables WHERE key = 'items';
 SQL
-    ) | "${HISTORIAN_SQLITE3}" "${HISTORIAN_DB}";
-    rm -f ${sanitized_src};
 }
 
 cmd_log() {
-    local args=$@
-    preflight_check;
-    fail_unless_db_exists;
+    preflight_check
+    fail_unless_db_exists
 
-    ( cat <<SQL
-.separator "\\n\\t"
-        SELECT id, command FROM history ORDER BY id DESC;
-SQL
-    ) | "${HISTORIAN_SQLITE3}" "${HISTORIAN_DB}" | less;
-}
-
-cmd_search() {
-    preflight_check;
-    ensure_db_exists;
-
-    local args=$@
-    _search "$args"
-}
-
-cmd_search_slash() {
-    preflight_check;
-    ensure_db_exists;
-
-    local args=$@
-    term="$(echo "$args" | sed -e 's/^.//g')";
-    _search "$term"
-}
-
-_search() {
-    local args=$@
-    ( cat <<SQL
+    historian_sqlite <<SQL | less
 .separator "\\n\\t"
         SELECT id, command
         FROM history
-        WHERE command LIKE '%${args}%'
         ORDER BY id DESC;
 SQL
-    ) | "${HISTORIAN_SQLITE3}" "${HISTORIAN_DB}";
+}
+
+cmd_search() {
+    preflight_check
+    ensure_db_exists
+
+    local -r args=( "$@" )
+    search_terms() {
+        for term in "${args[@]}"; do
+            local quoted_term=${term//\'/\'\'}
+            echo "AND command LIKE '%${quoted_term}%'"
+        done
+    }
+
+    historian_sqlite <<SQL
+.separator "\\n\\t"
+        SELECT id, command
+        FROM history
+        WHERE 1
+        $(search_terms)
+        ORDER BY id DESC;
+SQL
 }
 
 cmd_shell() {
-    local args=$@
-    preflight_check;
-    fail_unless_db_exists;
+    preflight_check
+    fail_unless_db_exists
 
     echo "${HISTORIAN_SQLITE3}" "${HISTORIAN_DB}" >&2
-    "${HISTORIAN_SQLITE3}" "${HISTORIAN_DB}";
+    historian_sqlite
 }
 
 cmd_version() {
@@ -163,36 +161,20 @@ cmd_version() {
 }
 
 main() {
-    local cmd=$1
+    local -r cmd=$1
     shift
     case $cmd in
-    config)
-        cmd_config $@
-        ;;
-    count)
-        cmd_count $@
-        ;;
-    import)
-        cmd_import $@
-        ;;
-    log)
-        cmd_log $@
-        ;;
-    search)
-        cmd_search $@
-        ;;
-    shell)
-        cmd_shell $@
-        ;;
-    version)
-        cmd_version $@
-        ;;
-    "")
+    "" | "-h" | "--help")
         usage
         ;;
+    /*)
+        # Strip trailing slash and concatenate arguments together for short-hand search.
+        cmd_search "$cmd" "${*:1}"
+        ;;
     *)
-        if [ -n "$(echo "$cmd" | grep -E '^/')" ]; then
-            cmd_search_slash $cmd $@
+        subcommand=cmd_${cmd}
+        if typeset -rF "$subcommand"; then
+            "$subcommand" "$@"
         else
             usage
             exit 1
@@ -201,4 +183,4 @@ main() {
     esac
 }
 
-main $@
+main "$@"
