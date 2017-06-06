@@ -4,7 +4,8 @@ typeset -r \
     VERSION="0.1.0" \
     DEBUG='' \
     HISTORIAN_WITH_TIMESTAMPS=${HISTORIAN_WITH_TIMESTAMPS-1} \
-    HISTORIAN_SRC=${HISTORIAN_SRC-"${HOME}/.bash_history"} \
+    HISTORIAN_BASH=${HISTORIAN_BASH-"${HOME}/.bash_history"} \
+    HISTORIAN_ZSH=${HISTORIAN_BASH-"${HOME}/.zsh_history"} \
     HISTORIAN_DB=${HISTORIAN_DB-"${HOME}/.historian.db"} \
     HISTORIAN_RC=${HISTORIAN_RC-"${HOME}/.historianrc"} \
     HISTORIAN_SQLITE3=${HISTORIAN_SQLITE3-"$(which sqlite3)"}
@@ -118,8 +119,8 @@ preflight_check() {
         exit 1
     fi
 
-    if [[ ! -f "${HISTORIAN_SRC}" ]]; then
-        error "HISTORIAN_SRC file $HISTORIAN_SRC does not exist"
+    if [[ ! -f "${HISTORIAN_BASH}" ]]; then
+        error "HISTORIAN_BASH file $HISTORIAN_BASH does not exist"
         exit 1
     fi
 }
@@ -144,6 +145,47 @@ ensure_db_exists() {
         CREATE VIRTUAL TABLE IF NOT EXISTS
             history_search USING fts4(id, history, command, command_timestamp);
 SQL
+}
+
+csv_from_extended_zsh_history() {
+    # NB. It is not 100% possible to disambiguate zsh lines from each other.
+    # This is because there can be any number of backslashes in the command history.
+    #
+    # However, in practice it is very unlikely for someone to construct
+    # lines like the following for zsh history.
+    # : 1234567890:0;whatever\
+    # : 1234567890:0;whatever\\\\
+    awk '
+    function print_row() {
+        cmd=""
+        for (i=1; i<length(lines); ++i) {
+          line = lines[i];
+          # Strip trailing backslash, add newline.
+          cmd = cmd substr(line, 1, length(line) - 1) RS
+        }
+        cmd = cmd lines[length(lines)]
+
+        # Escape quotes:
+        gsub("\"","\"\"", cmd);
+        # CSV row of form "timestamp,command"
+        print t ",\"" cmd "\"";
+    }
+
+    {
+        if(match($0, /^: ([1-9][0-9]{8,9}):[0-9]+;(.*)$/, a)) {
+            if (t && length(lines) > 0) { print_row(); }
+            delete lines;
+            t=a[1]; line=a[2];
+        } else {
+            line = $0;
+        }
+        lines[length(lines) + 1] = line;
+    }
+
+    END {
+        if (t && length(lines) > 0) { print_row(); }
+    }
+    '
 }
 
 csv_from_bash_history() {
@@ -180,6 +222,7 @@ csv_from_bash_history() {
         # CSV row of form "timestamp,command"
         print t ",\"" cmd "\"";
     }
+
     # Match timestamp lines
     /^#[1-9][0-9]{8,9}$/ {
         # Print a CSV row IF there is a timestamp associated with it.
@@ -198,7 +241,8 @@ csv_from_bash_history() {
     END {
         # Print any final line if one exists
         if (t && cmd) { print_row() }
-    }'
+    }
+    '
 }
 
 if [[ ! $HISTORIAN_WITH_TIMESTAMPS = 1 ]]; then
@@ -224,7 +268,8 @@ fail_unless_db_exists() {
 cmd_config() {
     cat <<EOF
 version:        ${VERSION}
-source_history: ${HISTORIAN_SRC}
+bash_history:   ${HISTORIAN_BASH}
+zsh_history:    ${HISTORIAN_ZSH}
 db:             ${HISTORIAN_DB}
 sqlite3:        ${HISTORIAN_SQLITE3}
 EOF
@@ -249,9 +294,17 @@ cmd_import() {
     cleanup() { rm -rf "$tmp"; }
     trap cleanup EXIT
 
-    csv_from_bash_history \
-        < "${HISTORIAN_SRC}" \
-        > "${history_csv_path}"
+    if [[ -f $HISTORIAN_BASH ]]; then
+        csv_from_bash_history \
+            < "${HISTORIAN_BASH}" \
+            >> "${history_csv_path}"
+    fi
+
+    if [[ -f $HISTORIAN_ZSH ]]; then
+        csv_from_extended_zsh_history \
+            < "${HISTORIAN_ZSH}" \
+            >> "${history_csv_path}"
+    fi
 
     insert_import_metadata > "$metadata_sql"
 
